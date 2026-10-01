@@ -1,0 +1,36 @@
+[package]
+name = "lion-session"
+version = "0.3.0"
+edition = "2021"
+description = "LionOS user session daemon: compositor, autostart, session bus, logout/power/lock"
+license = "MIT"
+
+[lib]
+name = "lion_session"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lion-session"
+path = "src/main.rs"
+
+[dependencies]
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "net"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+users = "0.11"
+libc = "0.2"
+
+[dev-dependencies]
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "net"] }
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

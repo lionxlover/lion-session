@@ -1,0 +1,47 @@
+# Optional user unit for lion-session.
+#
+# The NORMAL start path is lion-greeter exec'ing the binary directly
+# (post-authentication, inside the PAM-opened logind session, as the
+# target user). This unit exists for the SECONDARY paths:
+#
+#   * D-Bus activation: `dbus-1/services/os.lionos.Session.service`
+#     points here, so a shell that starts before the manager (or a
+#     manager crash-restart) gets `os.lionos.Session` back without
+#     anyone polling — the same activation depth GNOME ships for
+#     org.gnome.SessionManager.
+#   * Debugging: `systemctl --user start lion-session` in a dev
+#     session, with journal capture for free.
+#
+# It is deliberately NOT the login path: starting a session manager
+# before authentication exists would be a design error.
+
+[Unit]
+Description=LionOS user session manager
+Documentation=man:lion-session(1)
+# The target groups apps spawned via systemd --user.
+Wants=lion-session.target
+After=lion-session.target
+
+[Service]
+Type=dbus
+BusName=os.lionos.Session
+ExecStart=/usr/bin/lion-session
+# Crash-restart with the same policy the greeter gets: systemd is the
+# supervisor, bus-name liveness is the health signal.
+Restart=on-failure
+RestartSec=1
+# Hardening: the manager needs no new privileges, no write access to
+# the system, and must not be ptrace-able by same-user processes (it
+# also applies this to itself at runtime — belt and braces).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+# It must be allowed to write its runtime dir (sockets).
+ReadWritePaths=%t
+# Session lifetime tracking.
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

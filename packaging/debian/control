@@ -1,0 +1,18 @@
+Source: lion-session
+Section: x11
+Priority: optional
+Maintainer: LionOS Project <packaging@lionos.org>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, dbus, python3
+Standards-Version: 4.6.2
+Homepage: https://lionos.org/
+
+Package: lion-session
+Architecture: linux-any
+Depends: ${misc:Depends}, ${shlibs:Depends}, dbus
+Description: LionOS user session manager
+ Owns a logged-in desktop session end-to-end: environment setup,
+ any-compositor supervision with crash recovery, XDG + TOML autostart
+ with phases and per-app cgroup limits, the cooperative
+ end-of-session protocol (query/veto/force), idle escalation into
+ lock/logout, lock-before-sleep and lock-on-shutdown, logind
+ inhibitors, and a versioned D-Bus surface (os.lionos.Session).

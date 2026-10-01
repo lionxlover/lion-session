@@ -1,0 +1,27 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_OPTIONS = terse
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	dh_auto_build -- build --release --frozen
+
+override_dh_auto_test:
+	dh_auto_test -- test --frozen --all-targets
+
+override_dh_auto_install:
+	install -Dm755 target/release/lion-session \
+		debian/lion-session/usr/bin/lion-session
+	install -Dm644 systemd/lion-session.target \
+		debian/lion-session/usr/lib/systemd/user/lion-session.target
+	install -Dm644 systemd/lion-session.service \
+		debian/lion-session/usr/lib/systemd/user/lion-session.service
+	install -Dm644 dbus-1/services/os.lionos.Session.service \
+		debian/lion-session/usr/share/dbus-1/services/os.lionos.Session.service
+	install -Dm644 etc/lionos/session.toml \
+		debian/lion-session/etc/lionos/session.toml
+	for doc in README.md CHANGELOG.md STABILITY.md SECURITY.md; do \
+		install -Dm644 $$doc debian/lion-session/usr/share/doc/lion-session/$$doc; \
+	done

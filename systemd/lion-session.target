@@ -1,0 +1,7 @@
+# systemd --user target that autostart apps (and lion-session itself) run
+# under, so `systemctl --user stop lion-session.target` cleanly tears down
+# everything the session started via systemd --user.
+[Unit]
+Description=LionOS user session
+Documentation=man:lion-session(1)
+StopWhenUnneeded=yes
