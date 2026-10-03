@@ -1,0 +1,32 @@
+# Example shell-service user unit (panel); wallpaper/notifications/
+# terminal/settings follow the same shape. The supervisor supervises
+# these through StartUnit/JobRemoved in systemd mode.
+
+[Unit]
+Description=LionOS panel
+PartOf=lion-session.target graph
+After=lion-compositor.service
+
+[Service]
+Type=notify
+ExecStart=/usr/lib/lion/lion-panel
+Restart=always
+# The supervisor's crash-loop policy is authoritative; keep the unit's
+# own restart bounded so both layers agree.
+RestartSec=100ms
+WatchdogSec=20
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=lion-session.target

@@ -1,0 +1,43 @@
+# lion-session.service — user unit (spec 02 §9)
+#
+# Started by logind/greeter at login (or D-Bus activation via
+# packaging/dbus/os.lion.Session1.service). Type=notify: READY=1 is sent
+# only once the compositor is up and shell services have started.
+#
+# §9 hardening: every directive below is deliberate; the empty
+# CapabilityBoundingSet is intentional (a session supervisor needs no
+# capabilities — power actions go through logind, not us).
+
+[Unit]
+Description=LionOS session supervisor (spec 02)
+Documentation=man:lion-session(8)
+# Started per login; the greeter/logind user session pulls it in.
+After=dbus.socket graphical-session-pre.target
+PartOf=graphical-session.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/lion-session
+ExecReload=/bin/kill -s HUP $MAINPID
+# SIGHUP reloads live config keys without dropping clients.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+WatchdogSec=30
+
+# ── §9 hardening ─────────────────────────────────────────────────────
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

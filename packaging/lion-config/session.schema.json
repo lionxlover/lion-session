@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lionos.org/schemas/session.schema.json",
+  "title": "Lion Session configuration (spec 02, session.*)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session"],
+  "properties": {
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "shutdown_timeout_ms": { "type": "integer", "minimum": 500, "maximum": 600000, "default": 8000, "description": "Grace period before force-killing apps during logout/shutdown (spec 02 §5)." },
+        "restore_apps": { "type": "boolean", "default": false, "description": "Opt-in session save/restore: relaunch remembered apps at next login." },
+        "autostart_delay_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 1500, "description": "Base delay for XDG autostart apps after the shell is ready." },
+        "desktop_name": { "type": "string", "default": "LionOS", "description": "Desktop id matched against OnlyShowIn/NotShowIn in autostart entries." },
+        "state_dir": { "type": ["string", "null"], "default": null, "description": "Directory for history/session state; defaults to $XDG_STATE_HOME/lion-session." },
+        "autostart_dirs": { "type": "array", "items": { "type": "string" }, "default": ["/etc/xdg/autostart", "~/.config/autostart"], "description": "XDG autostart directories, in precedence order (later entries override by desktop-file id)." },
+        "services": {
+          "type": "array",
+          "description": "Supervised shell services. Started in dependency order; ready-gate services hold back SessionReady.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string" },
+              "unit": { "type": ["string", "null"], "description": "systemd user unit (systemd mode)." },
+              "exec": { "type": ["array", "null"], "items": { "type": "string" }, "description": "argv for direct mode; required when unit is absent." },
+              "after": { "type": "array", "items": { "type": "string" }, "default": [] },
+              "restart": { "enum": ["always", "on-failure", "never"], "default": "always" },
+              "ready_gate": { "type": "boolean", "default": false, "description": "Gates the SessionReady signal (panel, wallpaper)." }
+            }
+          },
+          "default": []
+        },
+        "compositor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "exec": { "type": "array", "items": { "type": "string" }, "default": ["/usr/lib/lion/lion-compositor"] },
+            "unit": { "type": ["string", "null"], "default": "lion-compositor.service" },
+            "wayland_display": { "type": "string", "default": "wayland-0", "description": "Socket basename awaited before shell services start." }
+          }
+        },
+        "crash_loop": {
+          "type": "object",
+          "description": "Crash-loop detection and backoff (spec 02 §3/§6).",
+          "additionalProperties": false,
+          "properties": {
+            "max_failures": { "type": "integer", "minimum": 2, "maximum": 100, "default": 5 },
+            "window_ms": { "type": "integer", "minimum": 1000, "default": 15000 },
+            "backoff_start_ms": { "type": "integer", "minimum": 1, "default": 100 },
+            "backoff_max_ms": { "type": "integer", "minimum": 1, "default": 5000 },
+            "notify_coalesce_ms": { "type": "integer", "minimum": 0, "default": 5000, "description": "Minimum gap between ServiceFailed notifications for one service (no storm)." }
+          }
+        },
+        "inhibit": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rate_per_minute": { "type": "integer", "minimum": 1, "default": 30 },
+            "max_active": { "type": "integer", "minimum": 1, "default": 64 }
+          }
+        },
+        "power_allowed_uids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "default": [], "description": "uids that may trigger power actions in the local-policy fallback (lion-auth is authoritative when reachable)." },
+        "greeter_session_id": { "type": ["string", "null"], "default": null, "description": "logind session id activated on SwitchUser; when null the seat auto-switches after LockSessions." },
+        "safe_mode": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "threshold": { "type": "integer", "minimum": 1, "default": 2, "description": "Consecutive bad starts before booting the minimal shell." },
+            "minimal_services": { "type": "array", "items": { "type": "string" }, "default": ["terminal", "settings"] }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "extra": { "type": "object", "additionalProperties": { "type": "string" }, "default": {} },
+            "import": { "type": "array", "items": { "type": "string" }, "description": "Variables imported from the launching environment.", "default": ["LANG", "LANGUAGE", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE", "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", "TZ"] }
+          }
+        },
+        "lion_auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "bus_name": { "type": "string", "default": "os.lionos.Auth1" },
+            "timeout_ms": { "type": "integer", "minimum": 1, "default": 500 },
+            "allowed_uids": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "default": [], "description": "uids allowed session-scoped actions in the local-policy fallback." }
+          }
+        },
+        "startup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "compositor_ready_timeout_ms": { "type": "integer", "minimum": 500, "default": 15000 },
+            "shell_ready_timeout_ms": { "type": "integer", "minimum": 500, "default": 20000 }
+          }
+        },
+        "bus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string", "default": "os.lionos.Session1" },
+            "register_rate_per_minute": { "type": "integer", "minimum": 1, "default": 30 }
+          }
+        }
+      }
+    }
+  }
+}

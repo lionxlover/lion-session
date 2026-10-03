@@ -1,465 +1,623 @@
-//! Configuration: built-in defaults, overlaid by `/etc/lionos/session.toml`,
-//! overlaid by `~/.config/lionos/session.toml` (or, if
-//! `$LION_SESSION_CONFIG` is set, that one file replaces both).
+#![forbid(unsafe_code)]
+//! Configuration loading and validation (the `lion-config` client).
 //!
-//! A broken config file is logged and ignored -- it must never be able to
-//! stop someone from logging in. `--check-config` reports problems without
-//! starting a session, for packagers and login-debugging.
+//! Spec 02 §5 keys, plus documented namespaced extensions for supervision,
+//! autostart, crash-loop and authorization policy. Canonical schema ships at
+//! `packaging/lion-config/session.schema.json` (embedded here so
+//! `--print-schema` never depends on the install tree) and the loader
+//! rejects unknown fields — fail closed on anything unexpected.
+//!
+//! Spec keys (defaults):
+//! - `session.shutdown_timeout_ms` (8000)
+//! - `session.restore_apps` (false)
+//! - `session.autostart_delay_ms` (1500)
 
+use crate::error::{Error, Result};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-use crate::idle::IdlePolicy;
+/// Canonical schema, embedded for `--print-schema`.
+pub const SCHEMA_JSON: &str = include_str!("../packaging/lion-config/session.schema.json");
 
-/// Startup ordering group. Lower starts first. TOML entries default per
-/// component below; XDG autostart entries always land in phase 3.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum Phase {
-    /// 0: display-critical (wallpaper, colour daemons)
-    Display = 0,
-    /// 1: shell chrome (panel, dock, hotkeys)
-    Shell = 1,
-    /// 2: session services (idle manager, OSD)
-    SessionServices = 2,
-    /// 3: external XDG autostart apps and user extras
-    #[default]
-    Applications = 3,
-}
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/lion/session.json";
 
-/// Phase used for XDG desktop entries (`Applications`).
-pub const XDG_PHASE: Phase = Phase::Applications;
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct Compositor {
-    pub command: String,
-    pub args: Vec<String>,
-    /// Wayland socket name the compositor must create (exported as
-    /// WAYLAND_DISPLAY), e.g. "wayland-1".
-    pub wayland_display: String,
-    pub ready_timeout_ms: u64,
-    /// Restart the compositor when it crashes (GNOME auto-restarts the
-    /// shell; we do the same for any compositor, with crash-loop backoff).
-    pub restart: bool,
-    /// Give up (and end the session) after this many compositor
-    /// restarts inside `crash_window_ms`.
-    pub max_restarts: u32,
-    pub crash_window_ms: u64,
-}
-
-impl Default for Compositor {
-    fn default() -> Self {
-        Self {
-            command: "lion-compositor".into(),
-            args: vec![],
-            wayland_display: "wayland-1".into(),
-            ready_timeout_ms: 15_000,
-            restart: true,
-            max_restarts: 3,
-            crash_window_ms: 60_000,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+/// Restart policy per supervised service (spec 02 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
-    Never,
+    /// Restart on any exit (shell services: the user keeps working).
     #[default]
-    OnFailure,
     Always,
+    /// Restart only on non-zero exit.
+    OnFailure,
+    /// Never restart; the exit stands.
+    Never,
 }
 
+/// One supervised service in the session plan.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct App {
+#[serde(deny_unknown_fields)]
+pub struct ServiceSpec {
+    /// Short name used in ordering, logs and `ServiceFailed` signals.
     pub name: String,
-    /// Defaults to `name`.
-    pub command: Option<String>,
+    /// systemd user unit to start (systemd mode; preferred when present).
     #[serde(default)]
-    pub args: Vec<String>,
+    pub unit: Option<String>,
+    /// argv to spawn directly (direct mode; required when `unit` is absent).
     #[serde(default)]
-    pub delay_ms: u64,
+    pub exec: Option<Vec<String>>,
+    /// Names that must be started first (dependency edges).
+    #[serde(default)]
+    pub after: Vec<String>,
+    /// `always` / `on-failure` / `never`.
     #[serde(default)]
     pub restart: RestartPolicy,
-    #[serde(default = "yes")]
-    pub enabled: bool,
-    /// Startup ordering group; see [`Phase`].
+    /// Whether this service gates `SessionReady` (panel + wallpaper).
     #[serde(default)]
-    pub phase: Phase,
-    /// 0.3.0 per-app resource limits (applied via systemd-run scopes;
-    /// logged-and-ignored on the direct-launch fallback). Values are
-    /// systemd cgroup property values: `"512M"`, `"2G"`, plain numbers.
-    #[serde(default)]
-    pub memory_max: Option<String>,
-    /// CPU weight 1..=10000 (systemd `CPUWeight=`).
-    #[serde(default)]
-    pub cpu_weight: Option<u32>,
-    /// Task (thread/process) cap for the app's cgroup.
-    #[serde(default)]
-    pub tasks_max: Option<u32>,
+    pub ready_gate: bool,
 }
 
-impl App {
-    /// The systemd cgroup properties this app requests, as
-    /// `--property=KEY=VALUE` arguments. Empty when unconfigured.
-    /// Values are validated *here* — the single point where config
-    /// data becomes argv: a NUL would abort posix_spawn, and anything
-    /// but systemd's own value grammar would make the whole scope fail
-    /// to start. Invalid values are skipped with a warning (fail-open:
-    /// the app starts unlimited, the config error is visible in the
-    /// journal and `--check-config`).
-    pub fn cgroup_properties(&self) -> Vec<String> {
-        let mut v = Vec::new();
-        if let Some(m) = &self.memory_max {
-            if valid_property_value(m) {
-                v.push(format!("--property=MemoryMax={m}"));
-            } else {
-                tracing::warn!(value = %m, "invalid memory-max ignored");
-            }
-        }
-        if let Some(w) = self.cpu_weight {
-            if (1..=10_000).contains(&w) {
-                v.push(format!("--property=CPUWeight={w}"));
-            } else {
-                tracing::warn!(value = w, "cpu-weight outside 1..=10000 ignored");
-            }
-        }
-        if let Some(t) = self.tasks_max {
-            if t > 0 {
-                v.push(format!("--property=TasksMax={t}"));
-            }
-        }
-        v
-    }
-}
-
-/// systemd size/percentage/relative value grammar: alphanumerics plus
-/// `. % + -` (covers `512M`, `2.5G`, `15%`, `+100M`, `infinity`).
-/// NUL is impossible here by construction; everything else unusual
-/// (shell metacharacters, whitespace) is systemd's own parser's
-/// problem — the value travels as one argv element, never a shell.
-fn valid_property_value(v: &str) -> bool {
-    !v.is_empty()
-        && v.len() <= 32
-        && v.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'%' | b'+' | b'-'))
-}
-
-fn yes() -> bool {
-    true
-}
-
-impl App {
-    fn named(name: &str, phase: Phase) -> Self {
-        Self {
-            name: name.into(),
-            command: None,
-            args: vec![],
-            delay_ms: 0,
-            restart: RestartPolicy::OnFailure,
-            enabled: true,
-            phase,
-            memory_max: None,
-            cpu_weight: None,
-            tasks_max: None,
+impl ServiceSpec {
+    /// How to run this service in the given mode: unit name or argv.
+    pub fn runnable(&self) -> Option<Runnable> {
+        match (&self.unit, &self.exec) {
+            (Some(u), _) => Some(Runnable::Unit(u.clone())),
+            (None, Some(argv)) if !argv.is_empty() => Some(Runnable::Exec(argv.clone())),
+            _ => None,
         }
     }
-    pub fn command(&self) -> &str {
-        self.command.as_deref().unwrap_or(&self.name)
-    }
 }
 
-/// Where Lock and power actions are forwarded, on the session bus.
+/// What a service resolves to in the active mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runnable {
+    Unit(String),
+    Exec(Vec<String>),
+}
+
+/// The compositor is special: if it dies the session ends (spec 02 §3).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct Services {
-    pub locker_service: String,
-    pub locker_path: String,
-    pub locker_interface: String,
-    pub power_service: String,
-    pub power_path: String,
-    pub power_interface: String,
+#[serde(deny_unknown_fields)]
+pub struct CompositorSpec {
+    /// argv for direct mode (default: the Smithay compositor binary).
+    #[serde(default = "default_compositor_exec")]
+    pub exec: Vec<String>,
+    /// systemd user unit in systemd mode.
+    #[serde(default = "default_compositor_unit")]
+    pub unit: Option<String>,
+    /// Wayland socket basename to await before starting shell services.
+    #[serde(default = "default_wayland_display")]
+    pub wayland_display: String,
 }
 
-impl Default for Services {
+impl Default for CompositorSpec {
     fn default() -> Self {
-        Self {
-            locker_service: "os.lionos.Locker".into(),
-            locker_path: "/os/lionos/Locker".into(),
-            locker_interface: "os.lionos.Locker1".into(),
-            power_service: "os.lionos.Power".into(),
-            power_path: "/os/lionos/Power".into(),
-            power_interface: "os.lionos.Power1".into(),
-        }
+        serde_json::from_str("{}").expect("static defaults parse")
     }
 }
 
-/// How autostart apps are launched.
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum Via {
-    /// Use `systemd-run --user --scope` when a systemd user manager is
-    /// reachable (so apps show up in `systemctl --user` and get their own
-    /// cgroup, exactly like GNOME does); fall back to direct children.
-    #[default]
-    Auto,
-    /// Always spawn as direct children of lion-session.
-    Never,
+fn default_compositor_exec() -> Vec<String> {
+    vec!["/usr/lib/lion/lion-compositor".into()]
+}
+fn default_compositor_unit() -> Option<String> {
+    Some("lion-compositor.service".into())
+}
+fn default_wayland_display() -> String {
+    "wayland-0".into()
 }
 
-/// Session-wide behavioural switches.
+/// Crash-loop detection window (spec 02 §3: "after N crashes in M seconds,
+/// stop retrying and notify the user").
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct SessionOptions {
-    /// How long apps may take to answer `QueryEndSession` / release their
-    /// inhibitors before the end is forced. Bounded on purpose: a wedged
-    /// app must never be able to hang logout forever.
-    pub end_timeout_ms: u64,
-    /// Lock the screen when the system is about to suspend (configurable
-    /// hardening: resume then requires re-authentication).
-    pub lock_on_sleep: bool,
-    /// Lock the screen the moment logind announces
-    /// `PrepareForShutdown` (0.3.0). A shutdown can still be *cancelled*
-    /// (another inhibitor, `shutdown -c`); if it is, the session is
-    /// already locked instead of sitting exposed through the whole
-    /// scare. GNOME locks on sleep; locking on *shutdown* is the
-    /// strictly-safer superset.
-    pub lock_on_shutdown: bool,
-    /// Honor `/etc/xdg/autostart` and `~/.config/autostart` desktop
-    /// entries (the cross-desktop autostart standard).
-    pub xdg_autostart: bool,
-    /// Supervise XDG autostart apps (restart on failure) instead of
-    /// starting them fire-and-forget like other desktops do.
-    pub supervise_xdg: bool,
-    /// How autostart apps are launched.
-    pub via: Via,
-    /// 0.3.0 idle escalation; see `idle.rs`. Zero values (the default)
-    /// keep 0.2.0 behaviour: hint forwarded, nothing escalates.
-    #[serde(flatten)]
-    pub idle: IdlePolicy,
+#[serde(deny_unknown_fields)]
+pub struct CrashLoopConfig {
+    /// N failures within the window → give up.
+    #[serde(default = "default_cl_failures")]
+    pub max_failures: u32,
+    /// M, the sliding window length.
+    #[serde(default = "default_cl_window")]
+    pub window_ms: u64,
+    /// First retry delay; doubles from here.
+    #[serde(default = "default_cl_backoff_start")]
+    pub backoff_start_ms: u64,
+    /// Retry delay cap.
+    #[serde(default = "default_cl_backoff_max")]
+    pub backoff_max_ms: u64,
+    /// Minimum gap between `ServiceFailed` notifications for the same
+    /// service — one notification, not a storm (spec 02 §6).
+    #[serde(default = "default_cl_notify")]
+    pub notify_coalesce_ms: u64,
 }
 
-impl Default for SessionOptions {
+impl Default for CrashLoopConfig {
     fn default() -> Self {
-        Self {
-            end_timeout_ms: 10_000,
-            lock_on_sleep: true,
-            lock_on_shutdown: true,
-            xdg_autostart: true,
-            supervise_xdg: false,
-            via: Via::Auto,
-            idle: IdlePolicy::default(),
-        }
+        serde_json::from_str("{}").expect("static defaults parse")
     }
 }
 
-#[derive(Debug, Clone)]
+fn default_cl_failures() -> u32 {
+    5
+}
+fn default_cl_window() -> u64 {
+    15_000
+}
+fn default_cl_backoff_start() -> u64 {
+    100
+}
+fn default_cl_backoff_max() -> u64 {
+    5000
+}
+fn default_cl_notify() -> u64 {
+    5000
+}
+
+/// Inhibitor abuse limits (spec 02 §8: rate-limit expensive calls).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InhibitConfig {
+    /// Max `Inhibit()` calls per caller per minute; excess is denied.
+    #[serde(default = "default_inh_rate")]
+    pub rate_per_minute: u32,
+    /// Hard cap on simultaneously held inhibitors.
+    #[serde(default = "default_inh_max")]
+    pub max_active: u32,
+}
+
+impl Default for InhibitConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("static defaults parse")
+    }
+}
+
+fn default_inh_rate() -> u32 {
+    30
+}
+fn default_inh_max() -> u32 {
+    64
+}
+
+/// Safe-mode trigger (spec 02 §3).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeModeConfig {
+    /// Consecutive bad starts (compositor crash before ready) that trip
+    /// safe mode on the next boot.
+    #[serde(default = "default_sm_threshold")]
+    pub threshold: u32,
+    /// Services to keep in safe mode (compositor is always kept).
+    #[serde(default = "default_sm_minimal")]
+    pub minimal_services: Vec<String>,
+}
+
+impl Default for SafeModeConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("static defaults parse")
+    }
+}
+
+fn default_sm_threshold() -> u32 {
+    2
+}
+fn default_sm_minimal() -> Vec<String> {
+    vec!["terminal".into(), "settings".into()]
+}
+
+/// Environment construction inputs (spec 02 §3 startup orchestration).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentConfig {
+    /// Extra KEY=VALUE pairs applied last (overrides).
+    #[serde(default)]
+    pub extra: std::collections::BTreeMap<String, String>,
+    /// Environment variables to import from the launching environment
+    /// (greeter/systemd user session) into the session environment.
+    #[serde(default = "default_env_pass")]
+    pub import: Vec<String>,
+}
+
+impl Default for EnvironmentConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("static defaults parse")
+    }
+}
+
+fn default_env_pass() -> Vec<String> {
+    vec![
+        "LANG".into(),
+        "LANGUAGE".into(),
+        "LC_CTYPE".into(),
+        "LC_NUMERIC".into(),
+        "LC_TIME".into(),
+        "LC_COLLATE".into(),
+        "LC_MONETARY".into(),
+        "LC_MESSAGES".into(),
+        "LC_PAPER".into(),
+        "LC_NAME".into(),
+        "LC_ADDRESS".into(),
+        "LC_TELEPHONE".into(),
+        "LC_MEASUREMENT".into(),
+        "LC_IDENTIFICATION".into(),
+        "TZ".into(),
+    ]
+}
+
+/// Authorization backend wiring (spec 02 §8: authorize through lion-auth).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// lion-auth bus name; fail closed when unreachable (spec §8).
+    #[serde(default = "default_auth_bus")]
+    pub bus_name: String,
+    /// Per-call timeout.
+    #[serde(default = "default_auth_timeout")]
+    pub timeout_ms: u64,
+    /// uids implicitly allowed session-scoped actions (the session owner is
+    /// always allowed). Power actions additionally need power_allowed_uids.
+    #[serde(default)]
+    pub allowed_uids: Vec<u32>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("static defaults parse")
+    }
+}
+
+fn default_auth_bus() -> String {
+    "os.lionos.Auth1".into()
+}
+fn default_auth_timeout() -> u64 {
+    500
+}
+
+/// Startup orchestration timeouts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupConfig {
+    /// Max wait for the compositor Wayland socket.
+    #[serde(default = "default_su_compositor")]
+    pub compositor_ready_timeout_ms: u64,
+    /// Max wait for ready-gate services after they started.
+    #[serde(default = "default_su_shell")]
+    pub shell_ready_timeout_ms: u64,
+}
+
+impl Default for StartupConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("static defaults parse")
+    }
+}
+
+fn default_su_compositor() -> u64 {
+    15_000
+}
+fn default_su_shell() -> u64 {
+    20_000
+}
+
+/// D-Bus service tuning.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BusConfig {
+    /// Well-known name to own.
+    #[serde(default = "default_bus_name")]
+    pub name: String,
+    /// Max `RegisterClient()` calls per caller per minute.
+    #[serde(default = "default_bus_reg_rate")]
+    pub register_rate_per_minute: u32,
+}
+
+impl Default for BusConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("static defaults parse")
+    }
+}
+
+fn default_bus_name() -> String {
+    "os.lionos.Session1".into()
+}
+fn default_bus_reg_rate() -> u32 {
+    30
+}
+
+/// Full `session.*` tree.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Grace period between announcing the end of the session (so the
-    /// shell can play its fade-out) and actually tearing it down.
-    pub logout_animation_ms: u64,
-    pub compositor: Compositor,
-    pub services: Services,
-    pub session: SessionOptions,
-    pub autostart: Vec<App>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct Raw {
-    pub logout_animation_ms: Option<u64>,
-    pub compositor: Option<Compositor>,
-    pub services: Option<Services>,
-    pub session: Option<RawSession>,
+    /// Spec: wait before force-killing apps (ms).
+    #[serde(default = "default_shutdown_timeout")]
+    pub shutdown_timeout_ms: u64,
+    /// Spec: opt-in session restore.
     #[serde(default)]
-    pub autostart: Vec<App>,
-}
-
-/// All-Option mirror of [`SessionOptions`] so a user file can override a
-/// single key without wiping the /etc layer for the others.
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct RawSession {
-    pub end_timeout_ms: Option<u64>,
-    pub lock_on_sleep: Option<bool>,
-    pub lock_on_shutdown: Option<bool>,
-    pub xdg_autostart: Option<bool>,
-    pub supervise_xdg: Option<bool>,
-    pub via: Option<Via>,
-    /// 0.3.0: `[session] lock-after-ms / logout-after-ms` (the idle
-    /// policy lives under [session] because it is one knob-set among
-    /// the session's behavioural switches; a separate [idle] table
-    /// would be a sixth top-level section for two keys).
-    pub lock_after_ms: Option<u64>,
-    pub logout_after_ms: Option<u64>,
+    pub restore_apps: bool,
+    /// Spec: base delay for autostart apps (ms).
+    #[serde(default = "default_autostart_delay")]
+    pub autostart_delay_ms: u64,
+    /// Desktop id used for OnlyShowIn/NotShowIn matching.
+    #[serde(default = "default_desktop_name")]
+    pub desktop_name: String,
+    /// Where history/state live; default resolves from XDG_STATE_HOME.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    /// XDG autostart dirs, in XDG order (later entries override earlier).
+    #[serde(default = "default_autostart_dirs")]
+    pub autostart_dirs: Vec<PathBuf>,
+    /// Supervised shell services.
+    #[serde(default = "default_services")]
+    pub services: Vec<ServiceSpec>,
+    /// The compositor.
+    #[serde(default)]
+    pub compositor: CompositorSpec,
+    /// Crash-loop / backoff tuning.
+    #[serde(default)]
+    pub crash_loop: CrashLoopConfig,
+    /// Inhibitor limits.
+    #[serde(default)]
+    pub inhibit: InhibitConfig,
+    /// uids allowed to trigger power actions on top of the lion-auth path
+    /// (empty = lion-auth + root only).
+    #[serde(default)]
+    pub power_allowed_uids: Vec<u32>,
+    /// Greeter session id (logind) for switch-user; None = rely on seat.
+    #[serde(default)]
+    pub greeter_session_id: Option<String>,
+    /// Safe mode policy.
+    #[serde(default)]
+    pub safe_mode: SafeModeConfig,
+    /// Environment construction.
+    #[serde(default)]
+    pub environment: EnvironmentConfig,
+    /// lion-auth wiring.
+    #[serde(default)]
+    pub lion_auth: AuthConfig,
+    /// Startup timeouts.
+    #[serde(default)]
+    pub startup: StartupConfig,
+    /// Bus tuning.
+    #[serde(default)]
+    pub bus: BusConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            logout_animation_ms: 350,
-            compositor: Compositor::default(),
-            services: Services::default(),
-            session: SessionOptions::default(),
-            autostart: [
-                ("lion-wallpaper", Phase::Display),
-                ("lion-panel", Phase::Shell),
-                ("lion-dock", Phase::Shell),
-                ("lion-hotkeys", Phase::Shell),
-                ("lion-idle", Phase::SessionServices),
-                ("lion-osd", Phase::SessionServices),
-            ]
-            .into_iter()
-            .map(|(n, p)| App::named(n, p))
-            .collect(),
-        }
+        serde_json::from_str("{}").expect("static defaults parse")
     }
+}
+
+fn default_shutdown_timeout() -> u64 {
+    8000
+}
+fn default_autostart_delay() -> u64 {
+    1500
+}
+fn default_desktop_name() -> String {
+    "LionOS".into()
+}
+fn default_autostart_dirs() -> Vec<PathBuf> {
+    vec!["/etc/xdg/autostart".into(), "~/.config/autostart".into()]
+}
+fn default_services() -> Vec<ServiceSpec> {
+    vec![
+        ServiceSpec {
+            name: "panel".into(),
+            unit: Some("lion-panel.service".into()),
+            exec: Some(vec!["/usr/lib/lion/lion-panel".into()]),
+            after: vec![],
+            restart: RestartPolicy::Always,
+            ready_gate: true,
+        },
+        ServiceSpec {
+            name: "wallpaper".into(),
+            unit: Some("lion-wallpaper.service".into()),
+            exec: Some(vec!["/usr/lib/lion/lion-wallpaper".into()]),
+            after: vec![],
+            restart: RestartPolicy::Always,
+            ready_gate: true,
+        },
+        ServiceSpec {
+            name: "notifications".into(),
+            unit: Some("lion-notifications.service".into()),
+            exec: Some(vec!["/usr/lib/lion/lion-notifications".into()]),
+            after: vec![],
+            restart: RestartPolicy::OnFailure,
+            ready_gate: false,
+        },
+        ServiceSpec {
+            name: "terminal".into(),
+            unit: Some("lion-terminal.service".into()),
+            exec: Some(vec!["/usr/lib/lion/lion-terminal".into()]),
+            after: vec!["panel".into()],
+            restart: RestartPolicy::OnFailure,
+            ready_gate: false,
+        },
+        ServiceSpec {
+            name: "settings".into(),
+            unit: Some("lion-settings.service".into()),
+            exec: Some(vec!["/usr/lib/lion/lion-settings".into()]),
+            after: vec!["panel".into()],
+            restart: RestartPolicy::OnFailure,
+            ready_gate: false,
+        },
+    ]
 }
 
 impl Config {
-    pub fn load() -> Self {
-        let mut cfg = Self::default();
-        for path in Self::config_paths() {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            match toml::from_str::<Raw>(&text) {
-                Ok(raw) => cfg.merge(raw),
-                Err(e) => {
-                    tracing::warn!(file = %path.display(), error = %e, "ignoring invalid config")
+    /// Load from a JSON file and validate (expects the `{"session":{…}}`
+    /// lion-config key-file shape).
+    pub fn load(path: &Path) -> Result<Config> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
+        Config::parse(&raw).map_err(|e| match e {
+            Error::Config(m) => Error::Config(format!("{}: {m}", path.display())),
+            other => other,
+        })
+    }
+
+    /// Load from an inline JSON string (tests, `--check-config` stdin).
+    /// Accepts the file form (`{"session":{...}}`) — the `lion-config`
+    /// key-file convention — and requires the wrapper (fail closed on
+    /// malformed structure).
+    pub fn parse(raw: &str) -> Result<Config> {
+        let v: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| Error::Config(format!("{e}")))?;
+        let inner = v
+            .get("session")
+            .cloned()
+            .ok_or_else(|| Error::Config("missing top-level \"session\" object".into()))?;
+        let cfg: Config =
+            serde_json::from_value(inner).map_err(|e| Error::Config(format!("{e}")))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Cross-field validation (fail closed; spec 02 §8).
+    pub fn validate(&self) -> Result<()> {
+        if !(500..=600_000).contains(&self.shutdown_timeout_ms) {
+            return Err(Error::Config(format!(
+                "session.shutdown_timeout_ms out of range [500, 600000]: {}",
+                self.shutdown_timeout_ms
+            )));
+        }
+        if self.autostart_delay_ms > 60_000 {
+            return Err(Error::Config(format!(
+                "session.autostart_delay_ms out of range [0, 60000]: {}",
+                self.autostart_delay_ms
+            )));
+        }
+        let cl = &self.crash_loop;
+        if cl.max_failures < 2 || cl.max_failures > 100 {
+            return Err(Error::Config(format!(
+                "session.crash_loop.max_failures out of range [2, 100]: {}",
+                cl.max_failures
+            )));
+        }
+        if cl.window_ms < 1_000 {
+            return Err(Error::Config(format!(
+                "session.crash_loop.window_ms below 1000: {}",
+                cl.window_ms
+            )));
+        }
+        if cl.backoff_start_ms == 0 || cl.backoff_max_ms < cl.backoff_start_ms {
+            return Err(Error::Config(
+                "session.crash_loop backoff_max_ms must be >= backoff_start_ms (>= 1)".into(),
+            ));
+        }
+        if self.inhibit.rate_per_minute == 0 || self.inhibit.max_active == 0 {
+            return Err(Error::Config("session.inhibit limits must be >= 1".into()));
+        }
+
+        // Services: unique names, runnable, deps known.
+        let mut names = HashSet::new();
+        for s in &self.services {
+            if s.name.is_empty() {
+                return Err(Error::Config("service with empty name".into()));
+            }
+            if !names.insert(s.name.clone()) {
+                return Err(Error::Config(format!("duplicate service name {}", s.name)));
+            }
+            if s.runnable().is_none() {
+                return Err(Error::Config(format!(
+                    "service {} has neither unit nor non-empty exec",
+                    s.name
+                )));
+            }
+        }
+        for s in &self.services {
+            for dep in &s.after {
+                if !names.contains(dep) {
+                    return Err(Error::Config(format!(
+                        "service {} depends on unknown service {}",
+                        s.name, dep
+                    )));
                 }
             }
         }
-        cfg
+        if self.services.is_empty() && self.compositor.exec.is_empty() {
+            return Err(Error::Config(
+                "no services and no compositor command".into(),
+            ));
+        }
+        if self.safe_mode.threshold == 0 {
+            return Err(Error::Config(
+                "session.safe_mode.threshold must be >= 1".into(),
+            ));
+        }
+        if self.startup.compositor_ready_timeout_ms < 500
+            || self.startup.shell_ready_timeout_ms < 500
+        {
+            return Err(Error::Config(
+                "session.startup timeouts must be >= 500ms".into(),
+            ));
+        }
+        if self.bus.name.is_empty() {
+            return Err(Error::Config("session.bus.name must not be empty".into()));
+        }
+        // lion_auth.bus_name == "" disables lion-auth (local policy);
+        // documented in DESIGN.md and session.schema.json.
+        if self.lion_auth.bus_name.len() > 128 {
+            return Err(Error::Config("session.lion_auth.bus_name too long".into()));
+        }
+        Ok(())
     }
 
-    /// Files to read, in order. `$LION_SESSION_CONFIG` replaces the
-    /// standard search (the same override convention lion-greeter uses).
-    fn config_paths() -> Vec<PathBuf> {
-        if let Some(p) = std::env::var_os("LION_SESSION_CONFIG") {
-            return vec![PathBuf::from(p)];
+    /// Effective state dir (XDG_STATE_HOME or HOME/.local/state).
+    pub fn state_dir(&self) -> PathBuf {
+        if let Some(p) = &self.state_dir {
+            return p.clone();
         }
-        let user_dir = std::env::var_os("XDG_CONFIG_HOME")
+        let xdg = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-        let mut v = vec![PathBuf::from("/etc/lionos/session.toml")];
-        if let Some(d) = user_dir.map(|d| d.join("lionos/session.toml")) {
-            v.push(d);
-        }
-        v
-    }
-
-    /// Scalars and tables replace outright; `[[autostart]]` entries merge
-    /// by name, so a user can disable a default with just
-    /// `{ name = "lion-dock", enabled = false }` instead of restating it.
-    fn merge(&mut self, raw: Raw) {
-        if let Some(ms) = raw.logout_animation_ms {
-            self.logout_animation_ms = ms;
-        }
-        if let Some(c) = raw.compositor {
-            self.compositor = c;
-        }
-        if let Some(s) = raw.services {
-            self.services = s;
-        }
-        if let Some(s) = raw.session {
-            let sess = &mut self.session;
-            if let Some(v) = s.end_timeout_ms {
-                sess.end_timeout_ms = v;
-            }
-            if let Some(v) = s.lock_on_sleep {
-                sess.lock_on_sleep = v;
-            }
-            if let Some(v) = s.lock_on_shutdown {
-                sess.lock_on_shutdown = v;
-            }
-            if let Some(v) = s.xdg_autostart {
-                sess.xdg_autostart = v;
-            }
-            if let Some(v) = s.supervise_xdg {
-                sess.supervise_xdg = v;
-            }
-            if let Some(v) = s.via {
-                sess.via = v;
-            }
-            if let Some(v) = s.lock_after_ms {
-                sess.idle.lock_after_ms = v;
-            }
-            if let Some(v) = s.logout_after_ms {
-                sess.idle.logout_after_ms = v;
-            }
-        }
-        for app in raw.autostart {
-            match self.autostart.iter_mut().find(|a| a.name == app.name) {
-                Some(existing) => *existing = app,
-                None => self.autostart.push(app),
-            }
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+        match xdg {
+            Some(base) => base.join("lion-session"),
+            None => PathBuf::from("/tmp/lion-session"),
         }
     }
 
-    /// Enabled apps in start order: phase, then delay, then name.
-    pub fn enabled_apps_sorted(&self) -> Vec<App> {
-        let mut apps: Vec<App> = self
-            .autostart
+    /// Services kept in safe mode: compositor + the intersection of
+    /// configured minimal services with defined services (warn on misses).
+    pub fn safe_mode_services(&self) -> Vec<ServiceSpec> {
+        let defined: HashSet<&str> = self.services.iter().map(|s| s.name.as_str()).collect();
+        let mut keep: Vec<ServiceSpec> = self
+            .services
             .iter()
-            .filter(|a| a.enabled)
+            .filter(|s| self.safe_mode.minimal_services.iter().any(|m| m == &s.name))
             .cloned()
             .collect();
-        apps.sort_by(|a, b| {
-            a.phase
-                .cmp(&b.phase)
-                .then(a.delay_ms.cmp(&b.delay_ms))
-                .then(a.name.cmp(&b.name))
-        });
-        apps
-    }
-}
-
-/// `--check-config`: validate every layer that would be read, without
-/// starting anything. Returns (all_ok, human report).
-pub fn check_config() -> (bool, String) {
-    let mut ok = true;
-    let mut report = String::new();
-    let paths = Config::config_paths();
-    if paths.len() == 1 && std::env::var_os("LION_SESSION_CONFIG").is_some() {
-        report.push_str(&format!("override: {}\n", paths[0].display()));
-    }
-    for path in paths {
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str::<Raw>(&text) {
-                Ok(_) => report.push_str(&format!("ok: {}\n", path.display())),
-                Err(e) => {
-                    ok = false;
-                    report.push_str(&format!("ERROR: {}: {e}\n", path.display()));
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                report.push_str(&format!(
-                    "absent (defaults in effect): {}\n",
-                    path.display()
-                ));
-            }
-            Err(e) => {
-                ok = false;
-                report.push_str(&format!("ERROR: {}: {e}\n", path.display()));
+        for miss in &self.safe_mode.minimal_services {
+            if !defined.contains(miss.as_str()) {
+                tracing::warn!(target: "config", "safe_mode service {miss} is not defined; skipped");
             }
         }
+        // Stable order matching the configured list.
+        keep.sort_by_key(|s| {
+            self.safe_mode
+                .minimal_services
+                .iter()
+                .position(|m| m == &s.name)
+                .unwrap_or(usize::MAX)
+        });
+        keep
     }
-    if ok {
-        let cfg = Config::load();
-        report.push_str(&format!(
-            "config OK: {} autostart apps, end-timeout {}ms, lock-on-sleep {}, lock-on-shutdown {}, idle lock-after {}ms logout-after {}ms\n",
-            cfg.autostart.len(),
-            cfg.session.end_timeout_ms,
-            cfg.session.lock_on_sleep,
-            cfg.session.lock_on_shutdown,
-            cfg.session.idle.lock_after_ms,
-            cfg.session.idle.logout_after_ms
-        ));
+
+    /// Expand `~` in autostart dirs against $HOME (XDG conventions).
+    pub fn autostart_dirs_expanded(&self) -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.autostart_dirs
+            .iter()
+            .map(|d| {
+                if d.starts_with("~") {
+                    match &home {
+                        Some(h) => h.join(d.strip_prefix("~/").unwrap_or(d.as_path())),
+                        None => PathBuf::from("/nonexistent"),
+                    }
+                } else {
+                    d.clone()
+                }
+            })
+            .collect()
     }
-    (ok, report)
 }
 
 #[cfg(test)]
@@ -467,167 +625,121 @@ mod tests {
     use super::*;
 
     #[test]
-    fn user_can_disable_and_add() {
-        let mut c = Config::default();
-        let raw: Raw = toml::from_str(
-            r#"
-            [[autostart]]
-            name = "lion-dock"
-            enabled = false
-            [[autostart]]
-            name = "my-app"
-            command = "/opt/x"
-            restart = "never"
-            "#,
+    fn defaults_are_valid() {
+        let cfg = Config::default();
+        cfg.validate().expect("defaults validate");
+        assert_eq!(cfg.shutdown_timeout_ms, 8000);
+        assert!(!cfg.restore_apps);
+        assert_eq!(cfg.autostart_delay_ms, 1500);
+    }
+
+    #[test]
+    fn spec_keys_load() {
+        let cfg = Config::parse(
+            r#"{"session":{"shutdown_timeout_ms":4000,"restore_apps":true,"autostart_delay_ms":500}}"#,
         )
         .unwrap();
-        c.merge(raw);
-        assert!(
-            !c.autostart
-                .iter()
-                .find(|a| a.name == "lion-dock")
-                .unwrap()
-                .enabled
-        );
-        assert_eq!(c.autostart.last().unwrap().command(), "/opt/x");
+        assert_eq!(cfg.shutdown_timeout_ms, 4000);
+        assert!(cfg.restore_apps);
+        assert_eq!(cfg.autostart_delay_ms, 500);
     }
 
     #[test]
-    fn session_options_merge_field_by_field() {
-        let mut c = Config::default();
-        let raw: Raw = toml::from_str("[session]\nend-timeout-ms = 2500\n").unwrap();
-        c.merge(raw);
-        assert_eq!(c.session.end_timeout_ms, 2500);
-        // everything else keeps the previous layer's value
-        assert!(c.session.lock_on_sleep);
-        assert_eq!(c.session.via, Via::Auto);
+    fn unknown_fields_rejected() {
+        let e = Config::parse(r#"{"session":{"shutdown_timeout":4000}}"#).unwrap_err();
+        assert!(matches!(e, Error::Config(_)));
     }
 
     #[test]
-    fn unknown_keys_and_bad_values_do_not_wreck_the_file() {
-        let raw: Result<Raw, _> = toml::from_str("[session]\nend-timeout-ms = 2500\nunknown = 1\n");
-        assert!(raw.is_ok()); // unknown keys are ignored (serde default)
-        let bad: Result<Raw, _> = toml::from_str("[session]\nend-timeout-ms = \"not a number\"\n");
-        assert!(bad.is_err()); // but type errors are rejected (and ignored at load)
+    fn missing_required_runnable_rejected() {
+        let e = Config::parse(r#"{"session":{"services":[{"name":"x"}]}}"#).unwrap_err();
+        assert!(e.to_string().contains("neither unit nor"));
     }
 
     #[test]
-    fn apps_sort_by_phase_then_delay_then_name() {
-        let mut c = Config::default();
-        let raw: Raw = toml::from_str(
-            r#"
-            [[autostart]]
-            name = "z-app"
-            phase = "display"
-            [[autostart]]
-            name = "a-late"
-            phase = "shell"
-            delay-ms = 400
-            [[autostart]]
-            name = "b-early"
-            phase = "shell"
-            delay-ms = 100
-            [[autostart]]
-            name = "disabled"
-            phase = "display"
-            enabled = false
-            "#,
+    fn unknown_dependency_rejected() {
+        let e = Config::parse(
+            r#"{"session":{"services":[{"name":"x","exec":["/bin/true"],"after":["ghost"]}]}}"#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("unknown service ghost"));
+    }
+
+    #[test]
+    fn duplicate_names_rejected() {
+        let e = Config::parse(
+            r#"{"session":{"services":[
+                {"name":"x","exec":["/bin/true"]},
+                {"name":"x","exec":["/bin/false"]}
+            ]}}"#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("duplicate service name x"));
+    }
+
+    #[test]
+    fn shutdown_timeout_bounds() {
+        let e = Config::parse(r#"{"session":{"shutdown_timeout_ms":100}}"#).unwrap_err();
+        assert!(e.to_string().contains("shutdown_timeout_ms"));
+    }
+
+    #[test]
+    fn crash_loop_backoff_bounds() {
+        let e = Config::parse(
+            r#"{"session":{"crash_loop":{"backoff_max_ms":50,"backoff_start_ms":100}}}"#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("backoff_max_ms"));
+    }
+
+    #[test]
+    fn safe_mode_intersection_and_order() {
+        let cfg = Config::parse(
+            r#"{"session":{"services":[
+                {"name":"panel","exec":["/bin/true"]},
+                {"name":"settings","exec":["/bin/true"]},
+                {"name":"terminal","exec":["/bin/true"]}
+            ],
+            "safe_mode":{"minimal_services":["terminal","settings","ghost"]}}}"#,
         )
         .unwrap();
-        c.merge(raw);
-        let sorted = c.enabled_apps_sorted();
-        let order: Vec<&str> = sorted.iter().map(|a| a.name.as_str()).collect();
+        let sm = cfg.safe_mode_services();
+        let names: Vec<&str> = sm.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["terminal", "settings"]);
+    }
+
+    #[test]
+    fn state_dir_respects_xdg() {
+        let cfg = Config::default();
+        // HOME is set in the test environment; assert the join shape.
+        let dir = cfg.state_dir();
+        assert!(dir.ends_with("lion-session"));
+    }
+
+    #[test]
+    fn autostart_tilde_expansion() {
+        let cfg = Config::default();
+        let dirs = cfg.autostart_dirs_expanded();
+        assert_eq!(dirs.len(), 2);
+        assert!(!dirs[1].starts_with("~"));
+        assert!(dirs[1].ends_with("autostart"));
+    }
+
+    #[test]
+    fn runnable_prefers_unit() {
+        let s = ServiceSpec {
+            name: "x".into(),
+            unit: Some("x.service".into()),
+            exec: Some(vec!["/bin/true".into()]),
+            after: vec![],
+            restart: RestartPolicy::Never,
+            ready_gate: false,
+        };
+        assert_eq!(s.runnable(), Some(Runnable::Unit("x.service".into())));
+        let s2 = ServiceSpec { unit: None, ..s };
         assert_eq!(
-            order,
-            vec![
-                "lion-wallpaper", // phase 0, delay 0, name
-                "z-app",          // phase 0, delay 0, name
-                "lion-dock",      // phase 1, delay 0 (defaults), name
-                "lion-hotkeys",
-                "lion-panel",
-                "b-early",   // phase 1, delay 100
-                "a-late",    // phase 1, delay 400
-                "lion-idle", // phase 2
-                "lion-osd",
-            ]
+            s2.runnable(),
+            Some(Runnable::Exec(vec!["/bin/true".into()]))
         );
-    }
-
-    #[test]
-    fn phase_names_map_to_ordering_groups() {
-        let raw: Raw = toml::from_str(
-            "[[autostart]]\nname = \"a\"\nphase = \"session-services\"\n[[autostart]]\nname = \"b\"\nphase = \"applications\"\n",
-        )
-        .unwrap();
-        assert_eq!(raw.autostart[0].phase, Phase::SessionServices);
-        assert_eq!(raw.autostart[1].phase, Phase::Applications);
-        assert!(Phase::Display < Phase::Shell);
-        assert!(Phase::SessionServices < Phase::Applications);
-    }
-
-    #[test]
-    fn compositor_defaults_are_recovery_safe() {
-        let c = Compositor::default();
-        assert!(c.restart);
-        assert_eq!(c.max_restarts, 3);
-        assert_eq!(c.crash_window_ms, 60_000);
-    }
-
-    #[test]
-    fn via_defaults_to_auto() {
-        assert_eq!(SessionOptions::default().via, Via::Auto);
-    }
-
-    #[test]
-    fn idle_policy_merges_field_by_field() {
-        let mut c = Config::default();
-        let raw: Raw = toml::from_str("[session]\nlock-after-ms = 300_000\n").unwrap();
-        c.merge(raw);
-        assert_eq!(c.session.idle.lock_after_ms, 300_000);
-        assert_eq!(c.session.idle.logout_after_ms, 0, "unset key untouched");
-        // Second layer only sets logout: lock survives.
-        let raw: Raw = toml::from_str("[session]\nlogout-after-ms = 900_000\n").unwrap();
-        c.merge(raw);
-        assert_eq!(c.session.idle.lock_after_ms, 300_000);
-        assert_eq!(c.session.idle.logout_after_ms, 900_000);
-        // Default is fully disabled (0.2.0 behaviour).
-        assert!(!Config::default().session.idle.is_configured());
-    }
-
-    #[test]
-    fn lock_on_shutdown_defaults_on() {
-        assert!(Config::default().session.lock_on_shutdown);
-        let mut c = Config::default();
-        let raw: Raw = toml::from_str("[session]\nlock-on-shutdown = false\n").unwrap();
-        c.merge(raw);
-        assert!(!c.session.lock_on_shutdown);
-    }
-
-    #[test]
-    fn per_app_resource_limits_parse() {
-        let raw: Raw = toml::from_str(
-            r#"
-            [[autostart]]
-            name = "hungry-app"
-            memory-max = "512M"
-            cpu-weight = 250
-            tasks-max = 128
-            "#,
-        )
-        .unwrap();
-        let mut c = Config::default();
-        c.merge(raw);
-        let app = c.autostart.iter().find(|a| a.name == "hungry-app").unwrap();
-        assert_eq!(
-            app.cgroup_properties(),
-            vec![
-                "--property=MemoryMax=512M".to_string(),
-                "--property=CPUWeight=250".to_string(),
-                "--property=TasksMax=128".to_string(),
-            ]
-        );
-        // Unconfigured apps request nothing.
-        let plain = c.autostart.iter().find(|a| a.name == "lion-dock").unwrap();
-        assert!(plain.cgroup_properties().is_empty());
     }
 }

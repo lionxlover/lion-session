@@ -1,0 +1,6 @@
+[D-BUS Service]
+Name=os.lionos.Session1
+# D-Bus activation: starting the service on first client call, backed by
+# the systemd user unit (spec 02 §9: prefer D-Bus/socket activation).
+Exec=/usr/bin/lion-session
+SystemdService=lion-session.service

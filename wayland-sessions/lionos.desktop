@@ -1,6 +1,0 @@
-[Desktop Entry]
-Name=LionOS
-Comment=LionOS desktop session (Smithay compositor, Obsidian Dark)
-Exec=lion-session
-Type=Application
-DesktopNames=LionOS

@@ -1,0 +1,110 @@
+#!/bin/sh
+# lionctl session — admin subcommand for lion-session (spec 02 §9).
+#
+# usage: lionctl session <status|lock|logout|restart|shutdown|suspend|
+#                         hibernate|switch-user|inhibit WHAT WHO WHY|
+#                         register APP_ID|signals|start|stop|restart|
+#                         reload|check|version|schema>
+
+set -eu
+
+CONFIG=${LION_SESSION_CONFIG:-/etc/lion/session.json}
+BINARY=$(command -v lion-session || echo /usr/bin/lion-session)
+CLIENT=$(command -v session_client 2>/dev/null || \
+         echo /usr/bin/session_client)
+
+cmd=${1:-status}
+shift 2>/dev/null || true
+
+call_bus() {
+    # busctl --user call os.lionos.Session1 /os/lionos/Session1 <iface> <method> [types args]
+    busctl --user call os.lionos.Session1 /os/lionos/Session1 os.lionos.Session1 "$@"
+}
+
+get_prop() {
+    busctl --user get-property os.lionos.Session1 /os/lionos/Session1 \
+      os.lionos.Session1 "$1" 2>/dev/null || echo "unavailable"
+}
+
+case "$cmd" in
+    status)
+        echo "State:            $(get_prop State)"
+        echo "InhibitedActions: $(get_prop InhibitedActions)"
+        echo "SafeMode:         $(get_prop SafeMode)"
+        echo "Blockers:         $(get_prop Blockers)"
+        ;;
+    lock)
+        call_bus Lock
+        ;;
+    logout)
+        call_bus Logout
+        ;;
+    restart)
+        call_bus Restart
+        ;;
+    shutdown)
+        call_bus Shutdown
+        ;;
+    suspend)
+        call_bus Suspend
+        ;;
+    hibernate)
+        call_bus Hibernate
+        ;;
+    switch-user)
+        call_bus SwitchUser
+        ;;
+    inhibit)
+        WHAT=${1:?usage: lionctl session inhibit WHAT WHO WHY}
+        WHO=${2:?usage: lionctl session inhibit WHAT WHO WHY}
+        WHY=${3:?usage: lionctl session inhibit WHAT WHO WHY}
+        if [ -x "$CLIENT" ]; then
+            exec "$CLIENT" inhibit "$WHAT" "$WHO" "$WHY"
+        else
+            echo "holding inhibitor via session_client is unavailable;" \
+                 "use session_client inhibit directly" >&2
+            exit 1
+        fi
+        ;;
+    register)
+        APP=${1:?usage: lionctl session register APP_ID}
+        if [ -x "$CLIENT" ]; then
+            exec "$CLIENT" register "$APP"
+        else
+            call_bus RegisterClient "s" "$APP"
+        fi
+        ;;
+    signals)
+        if [ -x "$CLIENT" ]; then
+            exec "$CLIENT" signals
+        else
+            busctl --user monitor --match "interface=os.lionos.Session1"
+        fi
+        ;;
+    start)
+        systemctl --user start lion-session.service
+        ;;
+    stop)
+        systemctl --user stop lion-session.service
+        ;;
+    restart-service)
+        systemctl --user restart lion-session.service
+        ;;
+    reload)
+        # SIGHUP reloads config without dropping clients
+        systemctl --user kill -s HUP --kill-who=main lion-session.service
+        ;;
+    check)
+        exec "$BINARY" --check-config --config "$CONFIG"
+        ;;
+    version)
+        exec "$BINARY" --version
+        ;;
+    schema)
+        exec "$BINARY" --print-schema
+        ;;
+    *)
+        echo "usage: lionctl session <status|lock|logout|restart|shutdown|suspend|hibernate|switch-user|inhibit WHAT WHO WHY|register APP_ID|signals|start|stop|restart-service|reload|check|version|schema>" >&2
+        exit 2
+        ;;
+esac

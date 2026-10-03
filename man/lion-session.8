@@ -1,0 +1,109 @@
+.TH LION-SESSION 8 "2026-10-03" "LionOS" "System Administration"
+.SH NAME
+lion-session \- LionOS per-user session supervisor (spec 02)
+.SH SYNOPSIS
+.B lion-session
+.RB [ \-\-version ]
+.RB [ \-\-check-config ]
+.RB [ \-\-print-schema ]
+.RB [ \-\-mock ]
+.RB [ \-\-config \fIPATH\fR ]
+.SH DESCRIPTION
+.B lion-session
+starts and supervises the Wayland compositor and every shell service,
+owns the session lifecycle, and executes logout, restart, shutdown,
+suspend, hibernate, lock and switch\-user through
+.BR logind (1),
+respecting inhibitors.
+.PP
+It serves
+.B os.lionos.Session1
+on the session bus at
+.BR /os/lionos/Session1
+(see
+.IR docs/DBUS.md ).
+Startup: session environment construction (XDG_*, WAYLAND_DISPLAY,
+DBUS_SESSION_BUS_ADDRESS, locale, theme) imported into systemd \-\-user;
+compositor launch (readiness via
+.BR sd_notify (3)
+READY=1); shell services in dependency order
+.RB ( lion\-session.target
+in systemd mode); SessionReady once the ready\-gate services (panel,
+wallpaper) are up; restored apps and XDG autostart afterwards.
+.PP
+Supervision: per\-service restart policies (always / on\-failure /
+never) with exponential backoff; crash\-loop detection stops retrying
+after N crashes in M seconds and notifies the user once. If the
+compositor dies the session ends cleanly. Repeated bad boots trip
+.B safe mode:
+a minimal shell (compositor + terminal + settings) with the reason
+surfaced.
+.PP
+End\-session flow: registered clients get
+.BR QueryEndSession ;
+all ack (or disconnect), or the
+.B session.shutdown_timeout_ms
+deadline expires; then
+.BR EndSession ,
+force\-kill (reverse dependency order), and the logind action.
+Inhibitors (logout/shutdown/suspend/idle/switch\-user) are held through
+file descriptors \- dropping the fd releases them.
+.SH OPTIONS
+.TP
+.BR \-\-version ", " \-V
+Print version and spec number, exit.
+.TP
+.B \-\-check\-config
+Load, parse and validate the configuration; exit 0/1. Combine with
+\-\-config.
+.TP
+.B \-\-print\-schema
+Print the lion\-config JSON schema (session.*) to stdout.
+.TP
+.B \-\-config \fIPATH\fR ", " \-c \fIPATH\fR
+Configuration file (default
+.IR /etc/lion/session.json ,
+or $LION_SESSION_CONFIG).
+.TP
+.B \-\-mock
+Demo mode: all backends faked, no D\-Bus. Scripted compositor/services
+(real processes). Not for production.
+.SH SIGNALS
+.TP
+.B SIGTERM
+Graceful shutdown: EndSession flow (no power action), services stopped
+in reverse dependency order, history marked clean.
+.TP
+.B SIGHUP
+Reload live configuration keys (timeouts, autostart delay, crash\-loop
+policy) without dropping the bus name or clients.
+.SH FILES
+.TP
+.I /etc/lion/session.json
+Configuration (schema:
+.IR packaging/lion\-config/session.schema.json ).
+.TP
+.IR $XDG_STATE_HOME/lion\-session/ .RS
+history.json (safe\-mode bookkeeping), state.json (opt\-in session
+restore snapshot).
+.RE
+.SH ENVIRONMENT
+.TP
+.B DBUS_SESSION_BUS_ADDRESS
+Session bus location (required in real mode; absent bus is fatal \- fail
+closed).
+.TP
+.B XDG_RUNTIME_DIR ", " XDG_STATE_HOME ", " XDG_SESSION_ID
+Standard XDG values; XDG_SESSION_ID selects the logind session to lock.
+.TP
+.B NOTIFY_SOCKET ", " WATCHDOG_USEC
+systemd Type=notify wiring (READY=1, WATCHDOG=1, STOPPING=1).
+.SH EXIT STATUS
+0 on clean end; 1 on startup failure (a bad start \- compositor never
+became ready \- is recorded toward safe mode); 2 on CLI misuse.
+.SH SEE ALSO
+.BR lionctl\-session (1),
+.BR systemd (1),
+.BR loginctl (1),
+.BR sd_notify (3),
+IR docs/DBUS.md

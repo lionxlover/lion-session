@@ -1,9 +1,12 @@
 [package]
 name = "lion-session"
-version = "0.3.0"
+version = "0.1.0"
 edition = "2021"
-description = "LionOS user session daemon: compositor, autostart, session bus, logout/power/lock"
-license = "MIT"
+rust-version = "1.80"
+description = "LionOS per-user session supervisor: compositor/shell startup, supervision, lifecycle actions (spec 02)"
+license = "MIT OR Apache-2.0"
+repository = "https://git.lionos.org/lion-session"
+publish = false
 
 [lib]
 name = "lion_session"
@@ -13,24 +16,43 @@ path = "src/lib.rs"
 name = "lion-session"
 path = "src/main.rs"
 
+[features]
+default = ["real-backends"]
+# Real D-Bus backends: org.freedesktop.systemd1 (user manager),
+# org.freedesktop.login1 (power/lock) and the os.lionos.Session1 service
+# itself. Audited unsafe FFI lives in `lion_session::sysffi` (pidfd) only;
+# every other module is `#![forbid(unsafe_code)]`.
+real-backends = ["dep:zbus"]
+
 [dependencies]
-zbus = { version = "4", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "process", "signal"] }
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-users = "0.11"
+serde_json = "1"
 libc = "0.2"
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
 
 [dev-dependencies]
-zbus = { version = "4", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "net"] }
-libc = "0.2"
+tempfile = "3"
+proptest = "1"
+tokio = { version = "1", features = ["test-util"] }
+
+[[example]]
+name = "session_client"
+path = "examples/session_client.rs"
+
+[[bench]]
+name = "lion_bench"
+path = "benches/lion_bench.rs"
+harness = false
 
 [profile.release]
-lto = true
+lto = "thin"
 codegen-units = 1
-panic = "abort"
-strip = true
+strip = "debuginfo"
+
+[profile.bench]
+debug = true

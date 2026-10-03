@@ -1,0 +1,17 @@
+# lion-session.target — the shell services target (spec 02 §3).
+#
+# In systemd mode lion-session StartUnit()s this target; its Wants=/
+# After= graph is the resolver's unit-level mirror, so startup is
+# parallel. Services mark themselves PartOf so stopping the target
+# stops the shell.
+
+[Unit]
+Description=LionOS shell services
+Documentation=man:lion-session(8)
+Wants=lion-compositor.service lion-panel.service lion-wallpaper.service lion-notifications.service
+After=lion-compositor.service
+# Ready-gate services (panel + wallpaper) gate SessionReady in the
+# supervisor; unit-level ordering only guarantees start-jobs done.
+
+[Install]
+WantedBy=graphical-session.target

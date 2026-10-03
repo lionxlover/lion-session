@@ -1,0 +1,6 @@
+{"component":"lion-session","metric":"resolver_2000_nodes_us","value":3605.0,"unit":"us"}
+{"component":"lion-session","metric":"autostart_parse_500_us","value":3447.0,"unit":"us"}
+{"component":"lion-session","metric":"inhibitors_10k_ops_us","value":2429.0,"unit":"us"}
+{"component":"lion-session","metric":"lifecycle_fsm_10k_us","value":2362.0,"unit":"us"}
+{"component":"lion-session","metric":"environment_build_ns","value":2260.7,"unit":"ns"}
+{"component":"lion-session","metric":"bench_process_rss_kb","value":4792,"unit":"kb"}

@@ -1,0 +1,87 @@
+# lion-session — reference configuration (spec 02 §5 keys + extensions).
+# Install to /etc/lion/session.json. Validate: lion-session --check-config.
+# Canonical schema: packaging/lion-config/session.schema.json
+{
+  "session": {
+    # ── spec 02 §5 ──────────────────────────────────────────────
+    "shutdown_timeout_ms": 8000,     # grace before force-killing apps
+    "restore_apps": false,           # opt-in session save/restore
+    "autostart_delay_ms": 1500,      # base delay for XDG autostart apps
+
+    # ── shell services (supervised) ─────────────────────────────
+    # Started in dependency order; ready_gate services hold back
+    # SessionReady. unit → systemd user unit; exec → direct spawn.
+    "services": [
+      { "name": "panel",
+        "unit": "lion-panel.service",
+        "exec": ["/usr/lib/lion/lion-panel"],
+        "after": [], "restart": "always", "ready_gate": true },
+      { "name": "wallpaper",
+        "unit": "lion-wallpaper.service",
+        "exec": ["/usr/lib/lion/lion-wallpaper"],
+        "after": [], "restart": "always", "ready_gate": true },
+      { "name": "notifications",
+        "unit": "lion-notifications.service",
+        "exec": ["/usr/lib/lion/lion-notifications"],
+        "after": [], "restart": "on-failure", "ready_gate": false },
+      { "name": "terminal",
+        "unit": "lion-terminal.service",
+        "exec": ["/usr/lib/lion/lion-terminal"],
+        "after": ["panel"], "restart": "on-failure", "ready_gate": false },
+      { "name": "settings",
+        "unit": "lion-settings.service",
+        "exec": ["/usr/lib/lion/lion-settings"],
+        "after": ["panel"], "restart": "on-failure", "ready_gate": false }
+    ],
+
+    "compositor": {
+      "exec": ["/usr/lib/lion/lion-compositor"],
+      "unit": "lion-compositor.service",
+      "wayland_display": "wayland-0"
+    },
+
+    # ── XDG autostart ───────────────────────────────────────────
+    "desktop_name": "LionOS",
+    "autostart_dirs": ["/etc/xdg/autostart", "~/.config/autostart"],
+
+    # ── supervision tuning ──────────────────────────────────────
+    "crash_loop": {
+      "max_failures": 5,          # N crashes in window → give up
+      "window_ms": 15000,
+      "backoff_start_ms": 100,    # delay doubles from here …
+      "backoff_max_ms": 5000,     # … capped here
+      "notify_coalesce_ms": 5000  # one ServiceFailed, not a storm
+    },
+
+    # ── inhibitors & rate limits ────────────────────────────────
+    "inhibit": { "rate_per_minute": 30, "max_active": 64 },
+
+    # ── authorization ───────────────────────────────────────────
+    # "os.lionos.Auth1" (default): ask lion-auth, fail closed.
+    # "" (development): local policy (session owner; power needs root
+    # or power_allowed_uids).
+    "lion_auth": {
+      "bus_name": "os.lionos.Auth1",
+      "timeout_ms": 500,
+      "allowed_uids": []
+    },
+    "power_allowed_uids": [],      # local-policy-only power grants
+    "greeter_session_id": null,    # switch-user target (null = seat)
+
+    # ── safe mode & restore ─────────────────────────────────────
+    "safe_mode": { "threshold": 2,
+                   "minimal_services": ["terminal", "settings"] },
+
+    # ── environment ─────────────────────────────────────────────
+    "environment": {
+      "import": ["LANG", "LC_CTYPE", "LC_TIME", "LC_MESSAGES", "TZ"],
+      "extra": {}
+    },
+
+    # ── timeouts & bus ──────────────────────────────────────────
+    "startup": { "compositor_ready_timeout_ms": 15000,
+                 "shell_ready_timeout_ms": 20000 },
+    "bus": { "name": "os.lionos.Session1",
+             "register_rate_per_minute": 30 }
+  }
+}

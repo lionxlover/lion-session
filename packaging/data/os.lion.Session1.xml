@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<node name="/os/lionos/Session1">
+  <!-- Canonical interface definition for os.lionos.Session1 (spec 02).
+       Docs: docs/DBUS.md. Extensions (EndSessionReply, Blockers) are
+       marked below. -->
+  <interface name="os.lionos.Session1">
+    <method name="Logout"/>
+    <method name="Restart"/>
+    <method name="Shutdown"/>
+    <method name="Suspend"/>
+    <method name="Hibernate"/>
+    <method name="Lock"/>
+    <method name="SwitchUser"/>
+    <method name="Inhibit">
+      <arg name="what" type="s" direction="in"/>
+      <arg name="who" type="s" direction="in"/>
+      <arg name="why" type="s" direction="in"/>
+      <arg name="fd" type="h" direction="out"/>
+    </method>
+    <method name="RegisterClient">
+      <arg name="app_id" type="s" direction="in"/>
+    </method>
+    <!-- LionOS extension -->
+    <method name="EndSessionReply">
+      <arg name="app_id" type="s" direction="in"/>
+    </method>
+    <signal name="SessionReady"/>
+    <signal name="QueryEndSession">
+      <arg name="flags" type="u"/>
+    </signal>
+    <signal name="EndSession">
+      <arg name="flags" type="u"/>
+    </signal>
+    <signal name="ServiceFailed">
+      <arg name="name" type="s"/>
+      <arg name="reason" type="s"/>
+    </signal>
+    <property name="State" type="s" access="read"/>
+    <property name="InhibitedActions" type="as" access="read"/>
+    <property name="SafeMode" type="b" access="read"/>
+    <!-- LionOS extension -->
+    <property name="Blockers" type="as" access="read"/>
+  </interface>
+</node>

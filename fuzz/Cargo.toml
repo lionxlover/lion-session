@@ -1,0 +1,34 @@
+[package]
+name = "lion-session-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Path to the library under test (spec 02 §10: fuzz every parser).
+lion-session = { path = "..", default-features = false }
+
+[[bin]]
+name = "parse_desktop"
+path = "fuzz_targets/parse_desktop.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenize_exec"
+path = "fuzz_targets/tokenize_exec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_history_json"
+path = "fuzz_targets/parse_history_json.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,19 @@
+#!/bin/sh
+# lion-session postinst: enable the user unit + D-Bus activation.
+set -eu
+
+if command -v systemctl >/dev/null 2>&1; then
+    # User units activate via D-Bus; no preset needed, but reload daemons
+    # so the activation file is picked up immediately.
+    systemctl --global enable lion-session.service 2>/dev/null || true
+fi
+
+if command -v dbus-send >/dev/null 2>&1 && [ -d /run/dbus ]; then
+    dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+      / org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+fi
+
+echo "lion-session: os.lionos.Session1 will activate on first use." >&2
+echo "Validate the config with: lion-session --check-config" >&2
+
+#DEBHELPER#

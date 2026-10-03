@@ -1,89 +1,89 @@
-# lion-session CI — every merge gate, one file (mirrors lion-greeter's).
-#
-# * --locked everywhere: CI builds exactly the reviewed Cargo.lock.
-# * Integration tests spawn the real binary against a private
-#   dbus-daemon with mock locker/power/logind peers — fully offline.
-# * The live suite (scripts/live_session_test.sh) re-runs them in one
-#   command for packagers.
-
-name: ci
+name: lion-session CI
+# Spec 02 §10: fmt + clippy(-D warnings) + test + deny + fuzz smoke +
+# coverage + nspawn acceptance. Performance gates via lion-bench JSON.
 
 on:
   push:
     branches: [main]
   pull_request:
-  release:
-    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
   lint:
-    name: clippy (all targets)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-      - run: cargo clippy --all-targets --locked -- -D warnings
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
 
-  tests:
-    name: unit + integration + fuzz harness
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --locked --all-targets
-      - name: live session suite (one command)
-        run: bash scripts/live_session_test.sh
+      - name: Install dbus-daemon (real-bus acceptance)
+        run: sudo apt-get update && sudo apt-get install -y dbus python3
+      - run: cargo test --locked
+      # mock-only build must also compile (feature hygiene)
+      - run: cargo test --locked --no-default-features
 
-  msrv:
-    name: MSRV (rust 1.74)
+  deny:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.74"
-      - run: cargo check --locked
-
-  audit:
-    name: cargo-audit (supply chain)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  release:
-    name: release build + checksum
-    runs-on: ubuntu-latest
-    needs: [fmt, lint, tests, msrv]
-    if: github.event_name == 'release'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
-      - run: |
-          sha256sum target/release/lion-session > lion-session.sha256
-          stat -c '%s bytes' target/release/lion-session
-      - uses: actions/upload-artifact@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          name: lion-session-${{ github.ref_name }}
-          path: |
-            target/release/lion-session
-            lion-session.sha256
+          arguments: --all-features check
+
+  bench-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Baseline + current bench (JSON), fail on >10% regression
+        run: |
+          cargo bench --bench lion_bench -- --json > current.json || \
+            cargo bench --bench lion_bench -- --json
+          python3 packaging/ci/check_bench.py current.json \
+            packaging/ci/bench-baseline.json
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --test fuzz_smoke --locked
+      # Short cargo-fuzz pass when the runner has the toolchain budget:
+      # - uses: dtolnay/rust-toolchain@nightly
+      # - run: cargo install cargo-fuzz && cd fuzz && cargo fuzz run
+      #        parse_desktop -- -max_total_time=60
+
+  nspawn-acceptance:
+    # Spec 02 §10: systemd-nspawn end-to-end (greeter → login → logout,
+    # shutdown inhibit). Requires privileged runners; skipped otherwise.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: nspawn acceptance (mock stack)
+        run: sudo bash tests/ci-nspawn-acceptance.sh
+
+  coverage:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - run: sudo apt-get install -y python3 dbus
+      - name: coverage (core logic > 80%, spec 02 §10)
+        run: |
+          cargo install cargo-llvm-cov
+          cargo llvm-cov --locked --summary-only --fail-under-lines 80

@@ -1,0 +1,57 @@
+# CLP package manifest for lion-session (spec 02 §13).
+# Signed builds + debug-symbol packages are produced by the CLP
+# toolchain from this manifest.
+
+[package]
+name = "lion-session"
+version = "0.1.0"
+spec = "02"
+summary = "LionOS per-user session supervisor"
+description = """
+Starts and supervises the compositor and every shell service, owns the
+session lifecycle (logout/restart/shutdown/suspend/hibernate/lock/
+switch-user through logind, inhibitors respected) and serves
+os.lionos.Session1 on the session bus.
+"""
+license = "MIT OR Apache-2.0"
+arch = ["x86_64", "aarch64"]
+homepage = "https://lionos.org"
+
+[build]
+profile = "release"
+locked = true
+features = ["real-backends"]
+tests = true
+bench = true
+
+[install]
+bin = ["target/release/lion-session:/usr/bin/lion-session"]
+libexec = []
+config = ["conf/lion-session.json:/etc/lion/session.json"]
+systemd-user = [
+  "packaging/systemd/lion-session.service",
+  "packaging/systemd/lion-session.target",
+  "packaging/systemd/lion-panel.service",
+]
+dbus-services = ["packaging/dbus/os.lion.Session1.service"]
+dbus-interfaces = ["packaging/data/os.lion.Session1.xml"]
+schemas = ["packaging/lion-config/session.schema.json:/usr/share/lionos/schemas/session.schema.json"]
+man = [
+  "man/lion-session.8:/usr/share/man/man8/",
+  "man/lionctl-session.1:/usr/share/man/man1/",
+]
+tools = ["packaging/lionctl/lionctl-session:/usr/bin/"]
+
+[depends]
+system = ["dbus", "systemd >= 248"]
+lions = ["lion-greeter >= 0.1"]
+recommends = ["lion-notifications >= 0.1"]
+
+[debug-symbols]
+package = "lion-session-dbg"
+strip = "debuginfo"
+
+[checks]
+schema = "packaging/lion-config/session.schema.json"
+check-config = "lion-session --check-config"
+smoke = "lion-session --version && lion-session --print-schema >/dev/null"

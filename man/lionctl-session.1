@@ -1,0 +1,50 @@
+.TH LIONCTL-SESSION 1 "2026-10-03" "LionOS" "User Commands"
+.SH NAME
+lionctl session \- admin subcommand for lion-session (spec 02 §9)
+.SH SYNOPSIS
+.B lionctl session
+.IR command " [" argument ...]
+.SH DESCRIPTION
+Operates the LionOS session supervisor through its D\-Bus service
+.BR os.lionos.Session1 .
+.SH COMMANDS
+.TP
+.B status
+Print State, InhibitedActions, SafeMode and current Blockers.
+.TP
+.B lock
+Lock the session (logind LockSession/LockSessions).
+.TP
+.B logout
+Request a graceful logout (query apps, respect inhibitors).
+.TP
+.B restart \fR|\fP shutdown \fR|\fP suspend \fR|\fP hibernate
+Lifecycle actions through logind.
+.TP
+.B switch\-user
+Lock all sessions and hand the seat to the greeter.
+.TP
+.B inhibit \fIWHAT\fP \fIWHO\fP \fIWHY\fP
+Hold an inhibitor (logout/shutdown/suspend/idle/switch\-user) until
+Ctrl\-C.
+.TP
+.B register \fIAPP_ID\fP
+Register as an end\-session client; acknowledges queries after 1 s.
+.TP
+.B signals
+Print SessionReady / QueryEndSession / EndSession / ServiceFailed as
+they arrive.
+.TP
+.BR check " / " version " / " schema
+\-\-check\-config / \-\-version / \-\-print\-schema of the daemon binary.
+.TP
+.BR start " / " stop " / " restart " / " reload
+systemctl \-\-user verbs for lion\-session.service (reload sends SIGHUP).
+.SH EXAMPLES
+.nf
+lionctl session status
+lionctl session inhibit shutdown lion\-updates "installing updates"
+lionctl session logout
+.fi
+.SH SEE ALSO
+.BR lion\-session (8)
